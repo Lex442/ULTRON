@@ -1,0 +1,819 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Wire.h>
+#include <RTClib.h>
+
+// --------------------- DEFINIÇÕES ---------------------
+#define PINO_SENSOR      32   // GPIO32 - Entrada do sensor
+#define PINO_SAIDA       33   // GPIO33 - Saída para simulação (remover)
+#define CS_SD            5    // GPIO5  - CS do cartão SD
+
+const char* NOME_MAQUINA = "IMPRESSÃO ( P2 )";  // Nome da máquina
+
+// (Opcional) Anti-bounce/de-ruído do log por pulso (em ms). 0 = desliga filtro.
+#define PULSE_LOG_MIN_MS 0
+
+// --------------------- OBJETOS ---------------------
+RTC_DS3231   rtc;
+WebServer    server(80);
+File         arquivoLog;
+
+// --- Pulso / status ---
+volatile bool    novaRotacao = false;
+unsigned long    tempoUltimaRotacao = 0, ultimoRegistro = 0;
+const unsigned long tempoLimiteParada = 10000;  // depois pode subir para 60000 (1 min)
+const unsigned long intervaloRegistro = 10000;  // (não usado mais p/ rotação)
+String           statusAtual = "Parada";
+
+// --- Contagem / turno ---
+bool         isRunning        = false;
+unsigned long runningStart    = 0;
+unsigned long dailyRunMillis  = 0;   // mantidos para eventual uso futuro
+unsigned long dailyStopMillis = 0;
+
+// *** Por turno (produção e parada)
+unsigned long shiftRunMillis  = 0;   // tempo de produção do turno (ms)
+unsigned long shiftStopMillis = 0;   // tempo parado do turno (ms)
+
+// --- Lista de paradas exibidas (RAM) ---
+#define MAX_PARADAS 40
+struct Parada {
+  DateTime      start;
+  DateTime      end;
+  unsigned long durMs;
+} paradas[MAX_PARADAS];
+int            numParadas       = 0;
+unsigned long  stopStartMillis  = 0;    // início da parada atual (millis)
+DateTime       stopStartDT;
+// Paradas >= 3min aparecem na tabela; as menores continuam somando no turno
+//const unsigned long paradaThreshold = 10UL * 1000UL; // 10 segundos
+
+const unsigned long paradaThreshold = 3UL * 60UL * 1000UL;
+
+// --- Controle de turno / histórico (últimos 3 turnos fechados) ---
+int lastShiftSlot = -1; // 0=06-13:59, 1=14-21:59, 2=22-05:59
+DateTime shiftStartDT;  // início do turno corrente (para label/horas)
+
+// Registro de turno fechado
+struct ShiftRecord {
+  DateTime startDT, endDT;
+  int      slot;                // 0/1/2
+  unsigned long runMs, stopMs;  // totais do turno
+  int      numParadas;          // paradas do turno
+  Parada   lista[MAX_PARADAS];
+};
+
+ShiftRecord history[3];
+int histCount = 0;   // quantos válidos (0..3)
+int histHead  = 0;   // índice do mais antigo (ring buffer)
+
+// --------------------- INTERRUPÇÃO ---------------------
+void IRAM_ATTR contarPulso() { novaRotacao = true; }
+
+// --------------------- Helpers ---------------------
+static void fmt_hms(uint32_t s, char* out, size_t n) {
+  uint32_t h = s / 3600U;
+  uint32_t m = (s % 3600U) / 60U;
+  uint32_t ss = s % 60U;
+  snprintf(out, n, "%02u:%02u:%02u", (unsigned)h, (unsigned)m, (unsigned)ss);
+}
+static void fmt_hms_maybe_mmss(uint32_t s, char* out, size_t n) {
+  uint32_t h = s / 3600U;
+  uint32_t m = (s % 3600U) / 60U;
+  uint32_t ss = s % 60U;
+  if (h) snprintf(out, n, "%02u:%02u:%02u", (unsigned)h, (unsigned)m, (unsigned)ss);
+  else   snprintf(out, n, "%02u:%02u",     (unsigned)m, (unsigned)ss);
+}
+// >>> Corrigido: relógio sempre em faixas válidas (0–23 / 0–59 / 0–59)
+static void fmt_time(DateTime dt, char* out, size_t n) {
+  uint8_t h = dt.hour()   % 24;
+  uint8_t m = dt.minute() % 60;
+  uint8_t s = dt.second() % 60;
+  snprintf(out, n, "%02u:%02u:%02u", (unsigned)h, (unsigned)m, (unsigned)s);
+}
+
+// Turnos
+// Turnos reais: 1º turno (06:00–13:59) | 2º turno (14:00–21:59) | 3º turno (22:00–05:59)
+static int currentShiftSlot(const DateTime& dt) {
+  uint8_t h = dt.hour();
+  if (h >= 6 && h < 14)  return 0;  // 1º turno
+  if (h >= 14 && h < 22) return 1;  // 2º turno
+  return 2;                         // 3º turno
+}
+
+
+
+
+
+
+static const char* slotLabel(int slot) {
+  switch (slot) {
+    case 0: return "1º turno (06–14)";
+    case 1: return "2º turno (14–22)";
+    default: return "3º turno (22–06)";
+  }
+}
+static void resetParadasView() { numParadas = 0; }
+
+// Guardar turno que acabou no histórico (ring de 3)
+static void pushShiftToHistory(DateTime endDT, int slot,
+                               unsigned long finalRunMs,
+                               unsigned long finalStopMs,
+                               bool estavaParado, unsigned long deltaParadaRestanteMs,
+                               DateTime deltaParadaStartDT) {
+  int idx;
+  if (histCount < 3) {
+    idx = (histHead + histCount) % 3;
+    histCount++;
+  } else {
+    idx = histHead;          // sobrescreve o mais antigo
+    histHead = (histHead + 1) % 3;
+  }
+
+  history[idx].startDT = shiftStartDT;
+  history[idx].endDT   = endDT;
+  history[idx].slot    = slot;
+  history[idx].runMs   = finalRunMs;
+  history[idx].stopMs  = finalStopMs;
+
+  // Copia paradas do turno que fechou
+  history[idx].numParadas = 0;
+  for (int i=0; i<numParadas && i<MAX_PARADAS; i++) {
+    history[idx].lista[history[idx].numParadas++] = paradas[i];
+  }
+  // Se turno fechou enquanto estava parado, cria a "parada parcial" até a virada
+  if (estavaParado && deltaParadaRestanteMs >= paradaThreshold &&
+      history[idx].numParadas < MAX_PARADAS) {
+    Parada extra { deltaParadaStartDT, endDT, deltaParadaRestanteMs };
+    history[idx].lista[history[idx].numParadas++] = extra;
+  }
+}
+
+// ---------- Clamp dos tempos do turno para nunca ultrapassar o decorrido ----------
+static void getShiftTotalsClamped(unsigned long nowMs, const DateTime& agora,
+                                  unsigned long& runMs, unsigned long& stopMs) {
+  unsigned long run = shiftRunMillis + (isRunning ? (nowMs - runningStart)     : 0);
+  unsigned long sto = shiftStopMillis + (!isRunning ? (nowMs - stopStartMillis) : 0);
+
+  unsigned long elapsed = 0;
+  uint32_t a = agora.unixtime(), s = shiftStartDT.unixtime();
+  if (a > s) elapsed = (unsigned long)(a - s) * 1000UL;
+
+  if (run + sto > elapsed) {
+    unsigned long over = (run + sto) - elapsed;
+    if (sto >= over) sto -= over;
+    else if (run >= over) run -= over;
+    else { run = 0; sto = elapsed; }
+  }
+  runMs  = run;
+  stopMs = sto;
+}
+
+// --------------------- HTML EM PROGMEM ---------------------
+const char INDEX_HTML_PART1[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>Painel de Produção</title>
+ <style>
+  :root { --run:#00ff00; --stop:#ff0000; } /* verde e vermelho */
+  body {
+    background: #111;
+    color: #eee;
+    font-family: sans-serif;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    padding: 10px;
+  }
+  .card {
+    background: #1e1e1e;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    padding: 16px;
+    margin: 10px;
+    width: 320px;
+    text-align: center;
+  }
+  h1 { font-size: 1.4em; color: #3b5989; margin: 0 0 8px; }
+  h2 { font-size: 1.1em; margin: 4px 0 12px; color: #fff; }
+  #date, #time { font-size: 0.9em; color: #aaa; margin-bottom: 6px; }
+  #statusContainer { font-size: 1em; margin-bottom: 8px; }
+  #statusLabel { color: #ff0; margin-right: 4px; }
+  .status.running { color: var(--run); }
+  .status.stopped { color: var(--stop); }
+  #runLabel { color: var(--run); margin-left: 4px; }
+  #downLabel { color: var(--stop); margin-left: 4px; }
+
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { padding: 6px; border-bottom: 1px solid #444; font-size: 0.85em; text-align:left; }
+  th { color: #3b5989; }
+
+  button {
+    background: #3b5989; color: #fff; border: none;
+    padding: 8px 16px; border-radius: 4px; cursor: pointer;
+    font-size: 0.9em; margin-top: 10px; font-weight:700;
+  }
+  button:hover { filter: brightness(1.15); }
+
+  /* Layout dos gráficos */
+  .piewrap { 
+    display: flex; 
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: flex-start;
+    gap: 40px; 
+    margin-top: 10px;
+  }
+  .piebox { 
+    position: relative; 
+    width: 220px; 
+    height: 250px; 
+    display: flex; 
+    flex-direction: column; 
+    align-items: center; 
+    justify-content: center;
+  }
+  .piebox canvas { width: 200px; height: 200px; }
+  .centro { 
+    position: absolute; 
+    top: 80px; 
+    left: 0; 
+    width: 100%; 
+    text-align: center; 
+    font-weight: 800; 
+    font-size: 1.1em; 
+    color: #fff; 
+  }
+  .sub { font-size: 0.8em; color:#bbb; margin-top:8px; text-align:center; }
+  .muted { color:#aaa; font-size:0.85em; text-align:center; margin-top:12px; }
+</style>
+</head>
+<body>
+  <!-- Card principal -->
+  <div class="card">
+    <h1>Painel de Produção</h1>
+    <h2>)rawliteral";
+
+const char INDEX_HTML_PART2[] PROGMEM = R"rawliteral(</h2>
+    <div id="date">--/--/----</div>
+    <div id="time">--:--:--</div>
+    <div id="statusContainer">
+      <span id="statusLabel">Status de produção:</span>
+      <span id="status" class="status stopped">Carregando...</span>
+    </div>
+    <div id="runContainer">
+      <span>Tempo de produção do turno:</span>
+      <span id="runLabel">00:00:00</span>
+    </div>
+    <div id="downContainer">
+      <span>Tempo parado do turno:</span>
+      <span id="downLabel">00:00:00</span>
+    </div>
+    <button onclick="window.location='/download'">Baixar Histórico de Rotações.txt</button>
+  </div>
+
+  <!-- Card paradas (turno corrente) -->
+  <div class="card">
+    <h1>Paradas</h1>
+    <table>
+      <thead><tr><th>Início</th><th>Fim</th><th>Duração</th></tr></thead>
+      <tbody id="paradasBody"></tbody>
+    </table>
+    <button onclick="window.location='/downloadParadas'">Baixar Historico de Paradas.txt</button>
+  </div>
+
+ <!-- Card: últimos 3 turnos (pizzas) -->
+<div class="card" style="width:100%; max-width:1050px;">
+  <h1>Últimos 3 turnos</h1>
+  <div class="piewrap">
+    <div class="piebox">
+      <canvas id="pie0" width="200" height="200"></canvas>
+      <div class="centro" id="pie0txt">--%</div>
+      <div class="sub" id="pie0sub">--</div>
+    </div>
+    <div class="piebox">
+      <canvas id="pie1" width="200" height="200"></canvas>
+      <div class="centro" id="pie1txt">--%</div>
+      <div class="sub" id="pie1sub">--</div>
+    </div>
+    <div class="piebox">
+      <canvas id="pie2" width="200" height="200"></canvas>
+      <div class="centro" id="pie2txt">--%</div>
+      <div class="sub" id="pie2sub">--</div>
+    </div>
+  </div>
+  <div class="muted" style="text-align:center; margin-top:12px;">
+    Verde = Rodando • Vermelho = Parado
+  </div>
+</div>
+
+
+  <!-- Card: paradas do turno anterior -->
+  <div class="card">
+    <h1>Paradas (turno anterior)</h1>
+    <table>
+      <thead><tr><th>Início</th><th>Fim</th><th>Duração</th></tr></thead>
+      <tbody id="prev0Body"></tbody>
+    </table>
+  </div>
+
+  <!-- Card: paradas do 2º turno anterior -->
+  <div class="card">
+    <h1>Paradas (2º turno anterior)</h1>
+    <table>
+      <thead><tr><th>Início</th><th>Fim</th><th>Duração</th></tr></thead>
+      <tbody id="prev1Body"></tbody>
+    </table>
+  </div>
+
+  <script>
+    function atualizaData() {
+      const d = new Date();
+      document.getElementById('date').textContent = d.toLocaleDateString('pt-BR');
+    }
+    async function atualizaHora() {
+      const h = await fetch('/time').then(r=>r.text());
+      document.getElementById('time').textContent = h;
+    }
+    async function atualizaInfo() {
+      const st = await fetch('/status').then(r=>r.text());
+      const el = document.getElementById('status');
+      el.textContent = (st==='Máquina Rodando'?'Rodando':'Parado');
+      el.className = 'status ' + (st==='Máquina Rodando'? 'running':'stopped');
+
+      const txtRun = await fetch('/runtime').then(r=>r.text());
+      document.getElementById('runLabel').textContent = txtRun;
+
+      const txtDown = await fetch('/downtime').then(r=>r.text());
+      document.getElementById('downLabel').textContent = txtDown;
+    }
+    async function atualizaParadas() {
+      const data = await fetch('/paradas').then(r=>r.json());
+      const body = document.getElementById('paradasBody');
+      body.innerHTML = '';
+      data.forEach(item => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${item.start}</td><td>${item.end}</td><td>${item.duration}</td>`;
+        body.appendChild(tr);
+      });
+    }
+
+    // --- Pies dos últimos três turnos fechados + tabelas de paradas anteriores
+    function drawPie(canvasId, centerId, subId, runH, stopH, label){
+      const c = document.getElementById(canvasId);
+      const ctx = c.getContext('2d');
+      const W=c.width, H=c.height, cx=W/2, cy=H/2, r=Math.min(W,H)/2-6;
+      ctx.clearRect(0,0,W,H);
+      const total = Math.max(0.0001, runH+stopH);
+      const pRun  = runH/total;
+      // fundo
+      ctx.beginPath(); ctx.fillStyle='#222'; ctx.arc(cx,cy,r,0,Math.PI*2); ctx.fill();
+      // azul rodando
+      let a0=-Math.PI/2, a1=a0+pRun*2*Math.PI;
+      ctx.beginPath(); ctx.moveTo(cx,cy);
+      ctx.fillStyle=getComputedStyle(document.documentElement).getPropertyValue('--run');   // verde
+      //ctx.fillStyle=getComputedStyle(document.documentElement).getPropertyValue('--blue');
+      ctx.arc(cx,cy,r,a0,a1); ctx.closePath(); ctx.fill();
+      // amarelo parado
+      a0=a1; a1=-Math.PI/2+Math.PI*2;
+      ctx.beginPath(); ctx.moveTo(cx,cy);
+     ctx.fillStyle=getComputedStyle(document.documentElement).getPropertyValue('--stop');   // vermelho
+     // ctx.fillStyle=getComputedStyle(document.documentElement).getPropertyValue('--yellow');
+      ctx.arc(cx,cy,r,a0,a1); ctx.closePath(); ctx.fill();
+      // anel central
+      ctx.beginPath(); ctx.fillStyle='#1a1a1a'; ctx.arc(cx,cy,r*0.62,0,Math.PI*2); ctx.fill();
+      // centro + legenda
+      const pct = Math.round(pRun*1000)/10;
+      document.getElementById(centerId).textContent = pct.toFixed(1)+'%';
+      document.getElementById(subId).textContent = `${label} — Rodando: ${runH.toFixed(2)}h • Parado: ${stopH.toFixed(2)}h`;
+    }
+
+    async function atualizaHistorico(){
+      const hist = await fetch('/lastShifts').then(r=>r.json()); // mais novo primeiro
+      // limpa textos quando não há dados suficientes
+      for (let i=0;i<3;i++){
+        if (!hist[i]) {
+          document.getElementById('pie'+i+'txt').textContent='--%';
+          document.getElementById('pie'+i+'sub').textContent='--';
+          const ctx = document.getElementById('pie'+i).getContext('2d');
+          ctx.clearRect(0,0,220,220);
+        }
+      }
+      hist.slice(0,3).forEach((t,i)=>{
+        drawPie('pie'+i, 'pie'+i+'txt', 'pie'+i+'sub', t.run_h, t.stop_h, t.label);
+      });
+
+      // Tabelas dos dois turnos anteriores
+      const tb0 = document.getElementById('prev0Body');
+      const tb1 = document.getElementById('prev1Body');
+      tb0.innerHTML=''; tb1.innerHTML='';
+      if (hist[0] && hist[0].paradas) {
+        hist[0].paradas.forEach(p=>{
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${p.start}</td><td>${p.end}</td><td>${p.duration}</td>`;
+          tb0.appendChild(tr);
+        });
+      }
+      if (hist[1] && hist[1].paradas) {
+        hist[1].paradas.forEach(p=>{
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${p.start}</td><td>${p.end}</td><td>${p.duration}</td>`;
+          tb1.appendChild(tr);
+        });
+      }
+    }
+
+    window.onload = () => {
+      atualizaData();
+      atualizaHora();
+      atualizaInfo();
+      atualizaParadas();
+      atualizaHistorico();
+      setInterval(atualizaHora, 1000);
+      setInterval(atualizaInfo, 3000);
+      setInterval(atualizaParadas, 10000);
+      setInterval(atualizaHistorico, 15000);
+    };
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// --------------------- SETUP ---------------------
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(PINO_SENSOR, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PINO_SENSOR), contarPulso, FALLING);
+
+  // RTC
+if (!rtc.begin()) { Serial.println("Erro RTC"); while (1); }
+
+// Só ajusta se o RTC tiver perdido a hora
+if (rtc.lostPower()) {
+  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+}
+
+  //if (rtc.lostPower())   rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+
+  // SD
+  if (!SD.begin(CS_SD))  { Serial.println("Erro SD"); while (1); }
+
+// Wi-Fi AP
+ // WiFi.softAP("P1-LOG","12345678");
+  //Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+  
+  // Configuração do IP da rede da ESP32
+//IPAddress local_IP(192,168,20,1);     // IP fixo da ESP32
+//IPAddress gateway(192,168,20,1);      // Gateway (igual ao IP no modo AP)
+//IPAddress subnet(255,255,255,0);      // Máscara de rede
+
+//if (!WiFi.softAPConfig(local_IP, gateway, subnet)) {
+ // Serial.println("Falha ao configurar IP");
+//}
+
+// Cria a rede Wi-Fi (SSID, Senha)
+//WiFi.softAP("UTECO-LOG", "12345678");
+
+//Serial.print("AP IP: ");
+//Serial.println(WiFi.softAPIP());
+
+  // -------- Wi-Fi (STA) – conecta na Mestre --------
+  
+WiFi.mode(WIFI_STA);
+IPAddress local_IP(192,168,50,6);   // IP fixo desta máquina
+IPAddress gateway(192,168,50,1);    // IP da Mestre (Central-LOG)
+IPAddress subnet(255,255,255,0);
+const char* ssid     = "CENTRAL-LOG";
+const char* password = "12345678";
+
+if (!WiFi.config(local_IP, gateway, subnet)) {
+  Serial.println("Falha ao configurar IP fixo");
+}
+WiFi.begin(ssid, password);
+Serial.print("Conectando à Mestre");
+while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+Serial.println();
+Serial.print("IP da máquina: ");
+Serial.println(WiFi.localIP());
+
+
+
+
+  // -------- Rotas HTTP --------
+  server.on("/", [](){
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/html", "");
+    server.sendContent_P(INDEX_HTML_PART1);
+    server.sendContent(NOME_MAQUINA);
+    server.sendContent_P(INDEX_HTML_PART2);
+  });
+
+  server.on("/download", [](){
+    File f = SD.open("/log.txt");
+    if (f) {
+      server.sendHeader("Content-Type","text/plain");
+      server.sendHeader("Content-Disposition","attachment; filename=log.txt");
+      server.streamFile(f,"text/plain");
+      f.close();
+    } else server.send(500,"text/plain","Erro ao abrir log.txt");
+  });
+
+  server.on("/downloadParadas", [](){
+    File f = SD.open("/paradas.txt");
+    if (f) {
+      server.sendHeader("Content-Type","text/plain");
+      server.sendHeader("Content-Disposition","attachment; filename=paradas.txt");
+      server.streamFile(f,"text/plain");
+      f.close();
+    } else server.send(500,"text/plain","Erro ao abrir paradas.txt");
+  });
+
+  server.on("/status", [](){
+    if (isRunning) server.send(200, "text/plain", "Máquina Rodando");
+    else           server.send(200, "text/plain", "Parada");
+  });
+
+  // Produção do TURNO (com clamp)
+  server.on("/runtime", [](){
+    unsigned long runMs, stopMs;
+    DateTime n = rtc.now();
+    getShiftTotalsClamped(millis(), n, runMs, stopMs);
+    char buf[16]; fmt_hms(runMs/1000U, buf, sizeof(buf));
+    server.send(200,"text/plain", buf);
+  });
+
+  // Parado no TURNO (com clamp)
+  server.on("/downtime", [](){
+    unsigned long runMs, stopMs;
+    DateTime n = rtc.now();
+    getShiftTotalsClamped(millis(), n, runMs, stopMs);
+    char buf[16]; fmt_hms(stopMs/1000U, buf, sizeof(buf));
+    server.send(200,"text/plain", buf);
+  });
+
+  // JSON paradas do turno corrente
+  server.on("/paradas", [](){
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "application/json", "");
+    server.sendContent("[");
+    for (int i=0; i<numParadas; i++){
+      char stTime[10], enTime[10], dur[16];
+      fmt_time(paradas[i].start, stTime, sizeof(stTime));
+      fmt_time(paradas[i].end,   enTime, sizeof(enTime));
+      fmt_hms_maybe_mmss(paradas[i].durMs/1000U, dur, sizeof(dur));
+      if (i > 0) server.sendContent(",");
+      server.sendContent("{\"start\":\"");
+      server.sendContent(stTime);
+      server.sendContent("\",\"end\":\"");
+      server.sendContent(enTime);
+      server.sendContent("\",\"duration\":\"");
+      server.sendContent(dur);
+      server.sendContent("\"}");
+    }
+    server.sendContent("]");
+  });
+
+  // JSON dos últimos 3 turnos fechados (mais novo primeiro)
+  server.on("/lastShifts", [](){
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "application/json", "");
+    server.sendContent("[");
+    // percorrer do mais novo ao mais antigo
+    for (int k=0; k<histCount; k++){
+      int idx = (histHead + histCount - 1 - k + 3) % 3;
+      if (k>0) server.sendContent(",");
+      // label + horas
+      float run_h  = history[idx].runMs  / 3600000.0f;
+      float stop_h = history[idx].stopMs / 3600000.0f;
+      server.sendContent("{\"label\":\"");
+      server.sendContent(slotLabel(history[idx].slot));
+      server.sendContent("\",\"run_h\":");   server.sendContent(String(run_h,2));
+      server.sendContent(",\"stop_h\":");    server.sendContent(String(stop_h,2));
+      server.sendContent(",\"paradas\":[");
+      for (int i=0;i<history[idx].numParadas;i++){
+        if (i>0) server.sendContent(",");
+        char st[10], en[10], du[16];
+        fmt_time(history[idx].lista[i].start, st, sizeof(st));
+        fmt_time(history[idx].lista[i].end,   en, sizeof(en));
+        fmt_hms_maybe_mmss(history[idx].lista[i].durMs/1000U, du, sizeof(du));
+        server.sendContent("{\"start\":\""); server.sendContent(st);
+        server.sendContent("\",\"end\":\""); server.sendContent(en);
+        server.sendContent("\",\"duration\":\""); server.sendContent(du);
+        server.sendContent("\"}");
+      }
+      server.sendContent("]}");
+    }
+    server.sendContent("]");
+  });
+
+  // >>> Relógio do topo (usa fmt_time com clamp)
+  server.on("/time", [](){
+    DateTime n = rtc.now();
+    char t[10];
+    fmt_time(n, t, sizeof(t));
+    server.send(200,"text/plain", t);
+  });
+
+  server.begin();
+
+  DateTime now = rtc.now();
+  lastShiftSlot = currentShiftSlot(now); // inicia slot atual
+  shiftStartDT  = now;                   // marca início do turno corrente (aproximação)
+}
+
+// --------------------- LOOP ---------------------
+void loop() {
+  server.handleClient();
+
+  unsigned long agoraMs = millis();
+  DateTime      agora   = rtc.now();
+
+  // (sem reset às 00:00)
+
+  // Virada de turno (06:00 / 14:00 / 22:00)
+  int slot = currentShiftSlot(agora);
+  if (slot != lastShiftSlot) {
+    // Calcula totais finais do turno que está terminando:
+    unsigned long finalRunMs  = shiftRunMillis  + (isRunning ? (agoraMs - runningStart)   : 0);
+    unsigned long finalStopMs = shiftStopMillis + (!isRunning ? (agoraMs - stopStartMillis): 0);
+
+    // Se estava parado, delta de parada até a virada:
+    bool estavaParado = !isRunning;
+    unsigned long deltaParada = estavaParado ? (agoraMs - stopStartMillis) : 0;
+
+    // Guarda no histórico (ring de 3)
+    pushShiftToHistory(
+      agora,                 // fim do turno
+      lastShiftSlot,         // qual turno estava
+      finalRunMs, finalStopMs,
+      estavaParado, deltaParada, stopStartDT
+    );
+
+    // Prepara novo turno
+    if (isRunning) {
+      runningStart = agoraMs; // novo turno inicia rodando a partir de agora
+    } else {
+      stopStartMillis = agoraMs; // continua parado no novo turno
+      stopStartDT     = agora;
+    }
+
+    // Zera acumuladores e tabela para o novo turno
+    shiftRunMillis  = 0;
+    shiftStopMillis = 0;
+    resetParadasView();
+    lastShiftSlot = slot;
+    shiftStartDT  = agora;   // início do novo turno
+  }
+
+  // Detecta parada por timeout
+  if (agoraMs - tempoUltimaRotacao > tempoLimiteParada) {
+    if (isRunning) {
+      isRunning         = false;
+      unsigned long delta = agoraMs - runningStart;
+      dailyRunMillis   += delta;
+      shiftRunMillis   += delta;       // acumula produção no turno
+      statusAtual       = "Parada";
+      stopStartMillis   = agoraMs;     // marca início da parada
+      stopStartDT       = agora;
+    }
+  }
+
+  // Chegou novo pulso (volta a rodar)
+  if (novaRotacao) {
+    novaRotacao           = false;
+    tempoUltimaRotacao    = agoraMs;
+
+    if (!isRunning) {
+      // Estava parado: fecha a parada
+      unsigned long dur = agoraMs - stopStartMillis;
+
+      if (dur>=paradaThreshold && numParadas<MAX_PARADAS) {
+        paradas[numParadas++] = { stopStartDT, agora, dur };
+
+        // grava em paradas.txt
+        File p = SD.open("/paradas.txt", FILE_APPEND);
+        if (p) {
+          String linha = stopStartDT.timestamp(DateTime::TIMESTAMP_DATE) + "," +
+                         stopStartDT.timestamp(DateTime::TIMESTAMP_TIME) + "," +
+                         agora.timestamp(DateTime::TIMESTAMP_TIME) + "," +
+                         String(dur/1000) + "\n";
+          p.print(linha);
+          p.close();
+        }
+      }
+
+      // acumula tempo parado no turno e no dia
+      dailyStopMillis += dur;
+      shiftStopMillis += dur;
+
+      // Transição para rodando
+      isRunning     = true;
+      runningStart  = agoraMs;
+    }
+
+    statusAtual = "Máquina Rodando";
+
+    // Log por pulso (opcional)
+    static unsigned long ultimoLogPulsoMs = 0;
+    if ((PULSE_LOG_MIN_MS == 0) || (agoraMs - ultimoLogPulsoMs >= PULSE_LOG_MIN_MS)) {
+      ultimoLogPulsoMs = agoraMs;
+      File f = SD.open("/log.txt", FILE_APPEND);
+      if (f) {
+        String linha = agora.timestamp(DateTime::TIMESTAMP_DATE) + " " +
+                       agora.timestamp(DateTime::TIMESTAMP_TIME) +
+                       " - Máquina: " + String(NOME_MAQUINA) +
+                       " - ROTAÇÃO DETECTADA\n";
+        f.print(linha);
+        f.close();
+      }
+    }
+  }
+}
+
+// DAKI PARA BAIXO E O CODIGO DA PLACA CENTRAL QUE VAI CONTROLAR AS OUTRAS
+
+
+#include <WiFi.h>
+#include <WebServer.h>
+
+// Servidor na Mestre
+WebServer server(80);
+
+// -------- Configuração do AP da Mestre --------
+IPAddress local_IP(192,168,50,1);   // IP fixo da Mestre
+IPAddress gateway(192,168,50,1);
+IPAddress subnet(255,255,255,0);
+
+void handleRoot() {
+  String html = R"rawliteral(
+  <!DOCTYPE html>
+  <html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <title>Painel Central</title>
+    <style>
+      body { margin:0; background:#000; color:#fff; display:flex; align-items:center; justify-content:center; height:100vh; }
+      iframe { width:100%; height:100%; border:none; }
+    </style>
+  </head>
+  <body>
+    <iframe id="maquinaFrame" src="http://192.168.50.4/"></iframe>
+
+    <script>
+      const maquinas = [
+        "http://192.168.50.4/",   // UTECO
+        "http://192.168.50.5/",   // P1
+        "http://192.168.50.6/",    // P2
+		"http://192.168.50.7/"    // P3
+      ];
+      let idx = 0;
+      setInterval(()=>{
+        idx = (idx+1) % maquinas.length;
+        document.getElementById("maquinaFrame").src = maquinas[idx];
+      }, 10000); // troca a cada 10 segundos
+    </script>
+  </body>
+  </html>
+  )rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Configura o Access Point da Mestre
+  if (!WiFi.softAPConfig(local_IP, gateway, subnet)) {
+    Serial.println("Falha ao configurar IP da Mestre");
+  }
+
+  WiFi.softAP("CENTRAL-LOG", "12345678");  // SSID e senha da rede
+  Serial.print("IP da Mestre: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Rota principal
+  server.on("/", handleRoot);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+}
+
+
+
+
+
+
+
+
+
+
